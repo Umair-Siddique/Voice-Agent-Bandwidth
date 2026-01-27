@@ -19,8 +19,11 @@ from fastapi import FastAPI, Response, WebSocket
 import uvicorn
 
 from models import BandwidthStreamEvent, StreamEventType, StreamMedia
+from dotenv import load_dotenv
 
-# Load environment variables
+# Load environment variables from .env file
+load_dotenv(dotenv_path="../.env")  # Load from parent directory since .env is in root
+
 console = Console()
 try:
     BW_ACCOUNT = os.environ["BW_ACCOUNT_ID"]
@@ -62,7 +65,7 @@ bandwidth_voice_api_instance = CallsApi(bandwidth_client)
 AGENT_TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.7))
 AGENT_VOICE = "alloy"
 AGENT_GREETING = "Howdy Partner! I'm your AI assistant. How can I help you today?"
-with open("sample-prompt.md", "r") as file:
+with open("sample-prompt.md", "r", encoding="utf-8") as file:
     AGENT_PROMPT = file.read()
 
 
@@ -255,6 +258,30 @@ def health():
     :return: None
     """
     return
+
+
+@app.get("/status")
+def status():
+    """
+    Status endpoint showing configuration details
+    :return: JSON with status information
+    """
+    return {
+        "status": "running",
+        "base_url": BASE_URL,
+        "local_port": LOCAL_PORT,
+        "log_level": LOG_LEVEL,
+        "openai_configured": bool(OPENAI_API_KEY),
+        "bandwidth_configured": bool(BW_ACCOUNT and BW_USERNAME and BW_PASSWORD),
+        "transfer_to": TRANSFER_TO,
+        "endpoints": {
+            "health": "/health",
+            "status": "/status",
+            "voice_initiate": "/webhooks/bandwidth/voice/initiate",
+            "voice_status": "/webhooks/bandwidth/voice/status",
+            "websocket": "/ws"
+        }
+    }
 
 
 @app.post("/webhooks/bandwidth/voice/initiate", status_code=http.HTTPStatus.OK)

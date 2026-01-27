@@ -1,10 +1,4 @@
-# Bandwidth + OpenAI Realtime Websockets Integration - Python
-
-<a href="https://dev.bandwidth.com/docs/voice/integrations/openai/realtime/sip">
-  <img src="icon.svg" title="Bandwidth OpenAI Realtime SIP Integration Guide" alt="Bandwidth OpenAI Realtime SIP Integration Guide"/>
-</a>
-
- # Table of Contents
+# Bandwidth + OpenAI Realtime Websockets Integration - Python # Table of Contents
 
 * [Description](#description)
 * [Pre-Requisites](#pre-requisites)
@@ -27,36 +21,51 @@ For more information about API credentials see our [Account Credentials](https:/
 
 # Environmental Variables
 
-The sample app uses the below environmental variables.
+The sample app uses the below environmental variables. Create a `.env` file in the root directory of the project with the following variables:
 
 ```sh
-BW_ACCOUNT_ID      # Your Bandwidth Account ID
-BW_USERNAME        # Your Bandwidth API Username
-BW_PASSWORD        # Your Bandwidth API Password
-OPENAI_API_KEY     # Your OpenAI API Key
-TRANSFER_TO        # The phone number to transfer the call to (in E.164 format, e.g. +19195551212)
-BASE_URL           # The base URL for your application (e.g. https://myapp.ngrok.io)
-LOG_LEVEL          # (optional) The logging level for the application (default: INFO)
-LOCAL_PORT         # (optional) The local port for the application (default: 5000)
+BW_ACCOUNT_ID=your_bandwidth_account_id
+BW_USERNAME=your_bandwidth_username
+BW_PASSWORD=your_bandwidth_password
+OPENAI_API_KEY=your_openai_api_key
+TRANSFER_TO=+19195551212  # The phone number to transfer the call to (in E.164 format)
+BASE_URL=https://your-ngrok-url.ngrok.io  # The base URL from ngrok (see Callback URLs section)
+LOG_LEVEL=INFO  # (optional) The logging level for the application (default: INFO)
+LOCAL_PORT=3000  # (optional) The local port for the application (default: 5000)
 ```
 
 # Running the Application
 
-This application is built using Python 3.13. You can use pip to install the required packages, or Docker Compose to run the application.
+This application is built using Python 3.13. Follow these steps to run the application locally:
 
-To install the required packages and run the application, you can use either of the following methods:
-
+1. **Create a virtual environment:**
 ```sh
-# Using Docker Compose 
-docker compose up --build
+python -m venv .venv
 ```
 
+2. **Activate the virtual environment:**
 ```sh
-# Using Python
-python -m venv .venv
+# On Windows
+.venv\Scripts\activate
+
+# On macOS/Linux
 source .venv/bin/activate
+```
+
+3. **Install the required packages:**
+```sh
 cd app
 pip install -r requirements.txt
+```
+
+4. **Set up your environment variables:**
+   - Create a `.env` file in the root directory with the required variables (see [Environmental Variables](#environmental-variables) section)
+
+5. **Set up ngrok for callback URLs:**
+   - Follow the instructions in the [Ngrok](#ngrok) section below to expose your local server
+
+6. **Run the application:**
+```sh
 python main.py
 ```
 
