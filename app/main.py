@@ -187,14 +187,23 @@ async def receive_from_bandwidth_ws(bandwidth_websocket: WebSocket, openai_webso
                     await openai_websocket.send(json.dumps(audio_append))
                 case StreamEventType.STREAM_STOPPED:
                     logger.info("stream stopped")
-                    await bandwidth_websocket.close()
-                    await openai_websocket.close()
+                    break
                 case _:
                     logger.warning(f"Unhandled event type: {event.event_type}")
     except websockets.exceptions.ConnectionClosedError as e:
         logger.error(f"WebSocket connection closed with error: {e}")
-        await bandwidth_websocket.close()
-        await openai_websocket.close()
+    except Exception as e:
+        logger.error(f"Error reading from Bandwidth WebSocket: {e}", exc_info=True)
+    finally:
+        if not bandwidth_websocket.client_state.name == "DISCONNECTED":
+            try:
+                await bandwidth_websocket.close()
+            except Exception:
+                pass
+        try:
+            await openai_websocket.close()
+        except Exception:
+            pass
 
 
 async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_websocket: WebSocket, call_id: str):
@@ -220,7 +229,11 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
                         event_type=StreamEventType.PLAY_AUDIO,
                         media=media
                     )
-                    await bandwidth_websocket.send_text(play_audio_event.model_dump_json(by_alias=True, exclude_none=True))
+                    try:
+                        await bandwidth_websocket.send_text(play_audio_event.model_dump_json(by_alias=True, exclude_none=True))
+                    except Exception as e:
+                        logger.warning(f"Failed to send audio to Bandwidth: {e}")
+                        break
                 case 'response.output_audio_transcript.done':
                     logger.info(openai_message.get('transcript'))
                 case 'conversation.item.done':
@@ -238,7 +251,11 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
                     clear_event = BandwidthStreamEvent(
                         event_type=StreamEventType.CLEAR,
                     )
-                    await bandwidth_websocket.send_text(clear_event.model_dump_json(by_alias=True, exclude_none=True))
+                    try:
+                        await bandwidth_websocket.send_text(clear_event.model_dump_json(by_alias=True, exclude_none=True))
+                    except Exception as e:
+                        logger.warning(f"Failed to send clear event to Bandwidth: {e}")
+                        break
                     last_assistant_item = None
                 case 'error':
                     logger.error(f"OpenAI Error: {openai_message.get('error').get('message')}")
@@ -252,8 +269,18 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
                     pass
     except websockets.exceptions.ConnectionClosedError as e:
         logger.error(f"OpenAI WebSocket connection closed with error: {e}")
-        await bandwidth_websocket.close()
-        await openai_websocket.close()
+    except Exception as e:
+        logger.error(f"Error reading from OpenAI WebSocket: {e}", exc_info=True)
+    finally:
+        try:
+            await openai_websocket.close()
+        except Exception:
+            pass
+        if not bandwidth_websocket.client_state.name == "DISCONNECTED":
+            try:
+                await bandwidth_websocket.close()
+            except Exception:
+                pass
 
 
 def handle_tool_call(function_name: str, call_id: str = None):
