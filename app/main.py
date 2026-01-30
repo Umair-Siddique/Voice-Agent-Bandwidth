@@ -218,7 +218,14 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
     try:
         async for message in openai_websocket:
             openai_message = json.loads(message)
-            match openai_message.get('type'):
+            message_type = openai_message.get('type')
+            logger.debug(f"OpenAI message: {message_type}")
+            
+            match message_type:
+                case 'session.created' | 'session.updated':
+                    logger.info(f"OpenAI session event: {message_type}")
+                case 'response.created' | 'response.done':
+                    logger.debug(f"Response event: {message_type}")
                 case 'response.output_audio.delta' if 'delta' in openai_message:
                     audio_payload = base64.b64encode(base64.b64decode(openai_message['delta'])).decode('utf-8')
                     media = StreamMedia(
@@ -356,8 +363,10 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
         name=call_id
     )
     bxml_response = Bxml(nested_verbs=[start_stream])
-
-    return Response(status_code=http.HTTPStatus.OK, content=bxml_response.to_bxml(), media_type="application/xml")
+    
+    bxml_content = bxml_response.to_bxml()
+    logger.info(f"Sending BXML for call {call_id}: {bxml_content}")
+    return Response(status_code=http.HTTPStatus.OK, content=bxml_content, media_type="application/xml")
 
 
 @app.websocket("/ws")
@@ -378,22 +387,33 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
             return
 
         logger.info(f"Attempting to connect to OpenAI for call ID: {call_id}")
-        async with websockets.connect(
-                f"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
-                additional_headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "OpenAI-Beta": "realtime=v1"
-                }
-        ) as openai_websocket:
-            logger.info(f"Connected to OpenAI WebSocket for call ID: {call_id}")
-            await initialize_openai_session(openai_websocket)
-            await asyncio.gather(
-                receive_from_bandwidth_ws(bandwidth_websocket, openai_websocket),
-                receive_from_openai_ws(openai_websocket, bandwidth_websocket, call_id)
-            )
+        try:
+            # Add connection timeout to prevent hanging
+            async with asyncio.timeout(10):
+                async with websockets.connect(
+                        f"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+                        additional_headers={
+                            "Authorization": f"Bearer {OPENAI_API_KEY}",
+                            "OpenAI-Beta": "realtime=v1"
+                        },
+                        open_timeout=10
+                ) as openai_websocket:
+                    logger.info(f"Connected to OpenAI WebSocket for call ID: {call_id}")
+                    await initialize_openai_session(openai_websocket)
+                    await asyncio.gather(
+                        receive_from_bandwidth_ws(bandwidth_websocket, openai_websocket),
+                        receive_from_openai_ws(openai_websocket, bandwidth_websocket, call_id)
+                    )
+        except asyncio.TimeoutError:
+            logger.error(f"Timeout connecting to OpenAI for call {call_id}")
+            await bandwidth_websocket.close(code=1011, reason="OpenAI connection timeout")
+            return
     except websockets.exceptions.InvalidStatusCode as e:
         logger.error(f"OpenAI WebSocket connection failed with status {e.status_code}: {e}")
-        await bandwidth_websocket.close(code=1011, reason="OpenAI connection failed")
+        try:
+            await bandwidth_websocket.close(code=1011, reason="OpenAI connection failed")
+        except:
+            pass
     except Exception as e:
         logger.error(f"Error in WebSocket handler for call {call_id}: {e}", exc_info=True)
         try:
