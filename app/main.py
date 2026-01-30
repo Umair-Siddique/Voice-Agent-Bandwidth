@@ -21,8 +21,9 @@ import uvicorn
 from models import BandwidthStreamEvent, StreamEventType, StreamMedia
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv(dotenv_path="../.env")  # Load from parent directory since .env is in root
+# Load environment variables from .env file (for local development)
+# In production (Render), environment variables are injected directly
+load_dotenv(dotenv_path="../.env")
 
 console = Console()
 try:
@@ -32,8 +33,8 @@ try:
     OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
     TRANSFER_TO = os.environ["TRANSFER_TO"]
     BASE_URL = os.environ["BASE_URL"]
-    LOG_LEVEL = os.environ["LOG_LEVEL"].upper()
-    LOCAL_PORT = int(os.environ.get("LOCAL_PORT", 3000))
+    LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # Default to INFO if not set
+    LOCAL_PORT = int(os.environ.get("PORT", os.environ.get("LOCAL_PORT", 3000)))
 except KeyError as e:
     msg = Text(" Missing environment variables! ", style="bold white on red")
     details = f"Required key not set: [yellow]{e.args[0]}[/yellow]\n\n"
@@ -65,12 +66,30 @@ bandwidth_voice_api_instance = CallsApi(bandwidth_client)
 AGENT_TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.7))
 AGENT_VOICE = "alloy"
 AGENT_GREETING = "Howdy Partner! I'm your AI assistant. How can I help you today?"
-with open("sample-prompt.md", "r", encoding="utf-8") as file:
-    AGENT_PROMPT = file.read()
+
+# Load prompt from file (handle both local and production paths)
+try:
+    with open("sample-prompt.md", "r", encoding="utf-8") as file:
+        AGENT_PROMPT = file.read()
+except FileNotFoundError:
+    # Fallback prompt if file not found
+    AGENT_PROMPT = "You are a helpful AI assistant. Be friendly and professional."
+    print("WARNING: sample-prompt.md not found, using default prompt")
 
 
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(title="Bandwidth + OpenAI Realtime Voice Agent", version="1.0.0")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Log startup information"""
+    logger.info("=" * 80)
+    logger.info("Bandwidth + OpenAI Realtime Voice Agent Started")
+    logger.info(f"Base URL: {BASE_URL}")
+    logger.info(f"Port: {LOCAL_PORT}")
+    logger.info(f"Environment: {'Production' if os.environ.get('PORT') else 'Development'}")
+    logger.info("=" * 80)
 
 
 def log_inspect(obj, label=None):
@@ -96,28 +115,34 @@ async def initialize_openai_session(websocket: ClientConnection):
     session_update = {
         "type": "session.update",
         "session": {
-            "type": "realtime",
-            "model": "gpt-realtime",
-            "output_modalities": ["audio"],
-            "audio": {
-                "input": {
-                    "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad"}
-                },
-                "output": {
-                    "format": {"type": "audio/pcmu"},
-                    "voice": AGENT_VOICE
-                }
-            },
+            "modalities": ["text", "audio"],
             "instructions": AGENT_PROMPT,
+            "voice": AGENT_VOICE,
+            "input_audio_format": "g711_ulaw",
+            "output_audio_format": "g711_ulaw",
+            "input_audio_transcription": {
+                "model": "whisper-1"
+            },
+            "turn_detection": {
+                "type": "server_vad",
+                "threshold": 0.5,
+                "prefix_padding_ms": 300,
+                "silence_duration_ms": 500
+            },
             "tools": [
                 {
                     "type": "function",
                     "name": "transfer_call",
                     "description": "Call this function when the user asks to be transferred.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
                 }
             ],
-            "tool_choice": "auto"
+            "tool_choice": "auto",
+            "temperature": AGENT_TEMPERATURE
         }
     }
     await websocket.send(json.dumps(session_update))
@@ -138,6 +163,7 @@ async def initialize_openai_session(websocket: ClientConnection):
     }
     await websocket.send(json.dumps(initial_conversation_item))
     await websocket.send(json.dumps({"type": "response.create"}))
+    logger.info(f"Sent initial greeting request to OpenAI")
     
 
 async def receive_from_bandwidth_ws(bandwidth_websocket: WebSocket, openai_websocket: ClientConnection):
@@ -300,9 +326,7 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
     start_stream = StartStream(
         destination=f"{websocket_url}?call_id={call_id}",
         mode="bidirectional",
-        name=call_id,
-        destination_username="foo",
-        destination_password="bar"
+        name=call_id
     )
     stop_stream = StopStream(name=call_id, wait="true")
     bxml_response = Bxml(nested_verbs=[start_stream, stop_stream])
@@ -318,25 +342,38 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
     :param call_id:
     :return: None
     """
-    await bandwidth_websocket.accept()
+    try:
+        await bandwidth_websocket.accept()
+        logger.info(f"Bandwidth WebSocket connection accepted for call ID: {call_id}")
 
-    if not call_id:
-        logger.error("No call_id provided in WebSocket connection")
-        await bandwidth_websocket.close(code=1008, reason="Missing call_id parameter")
-        return
+        if not call_id:
+            logger.error("No call_id provided in WebSocket connection")
+            await bandwidth_websocket.close(code=1008, reason="Missing call_id parameter")
+            return
 
-    async with websockets.connect(
-            f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={AGENT_TEMPERATURE}",
-            additional_headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}"
-            }
-    ) as openai_websocket:
-        logger.info("Connected to OpenAI WebSocket")
-        await initialize_openai_session(openai_websocket)
-        await asyncio.gather(
-            receive_from_bandwidth_ws(bandwidth_websocket, openai_websocket),
-            receive_from_openai_ws(openai_websocket, bandwidth_websocket, call_id)
-        )
+        logger.info(f"Attempting to connect to OpenAI for call ID: {call_id}")
+        async with websockets.connect(
+                f"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+                additional_headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "OpenAI-Beta": "realtime=v1"
+                }
+        ) as openai_websocket:
+            logger.info(f"Connected to OpenAI WebSocket for call ID: {call_id}")
+            await initialize_openai_session(openai_websocket)
+            await asyncio.gather(
+                receive_from_bandwidth_ws(bandwidth_websocket, openai_websocket),
+                receive_from_openai_ws(openai_websocket, bandwidth_websocket, call_id)
+            )
+    except websockets.exceptions.InvalidStatusCode as e:
+        logger.error(f"OpenAI WebSocket connection failed with status {e.status_code}: {e}")
+        await bandwidth_websocket.close(code=1011, reason="OpenAI connection failed")
+    except Exception as e:
+        logger.error(f"Error in WebSocket handler for call {call_id}: {e}", exc_info=True)
+        try:
+            await bandwidth_websocket.close(code=1011, reason="Internal server error")
+        except:
+            pass
 
 
 @app.post("/webhooks/bandwidth/voice/status", status_code=http.HTTPStatus.NO_CONTENT)
@@ -362,12 +399,17 @@ def start_server(port: int) -> None:
     :param port: The port to run the server on
     :return: None
     """
+    logger.info(f"Starting server on port {port}")
+    logger.info(f"Base URL: {BASE_URL}")
+    logger.info(f"Log Level: {LOG_LEVEL}")
+    
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
         log_level="info",
-        reload=True,
+        reload=False,
+        access_log=True,
     )
 
 
