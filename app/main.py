@@ -10,7 +10,7 @@ from websockets import ClientConnection
 
 from bandwidth import Configuration, ApiClient, CallsApi
 from bandwidth.models import InitiateCallback, DisconnectCallback
-from bandwidth.models.bxml import PhoneNumber, StartStream, StopStream, Transfer, Bxml
+from bandwidth.models.bxml import PhoneNumber, StartStream, Transfer, Bxml
 from rich import inspect
 from rich.console import Console
 from rich.panel import Panel
@@ -355,8 +355,7 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
         mode="bidirectional",
         name=call_id
     )
-    stop_stream = StopStream(name=call_id)
-    bxml_response = Bxml(nested_verbs=[start_stream, stop_stream])
+    bxml_response = Bxml(nested_verbs=[start_stream])
 
     return Response(status_code=http.HTTPStatus.OK, content=bxml_response.to_bxml(), media_type="application/xml")
 
