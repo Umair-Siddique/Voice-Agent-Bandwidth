@@ -328,7 +328,7 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
         mode="bidirectional",
         name=call_id
     )
-    stop_stream = StopStream(name=call_id, wait="true")
+    stop_stream = StopStream(name=call_id)
     bxml_response = Bxml(nested_verbs=[start_stream, stop_stream])
 
     return Response(status_code=http.HTTPStatus.OK, content=bxml_response.to_bxml(), media_type="application/xml")
