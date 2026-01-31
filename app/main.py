@@ -480,12 +480,12 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
 
     websocket_url = f"wss://{BASE_URL.replace('https://', '').replace('http://', '')}/ws"
     destination = f"{websocket_url}?call_id={call_id}"
-    # Keep the call open while streaming audio to/from OpenAI.
+    # StartStream opens a bidirectional audio stream. The call stays active
+    # as long as the WebSocket connection is maintained.
     bxml_content = (
         "<?xml version='1.0' encoding='UTF-8'?>"
         "\n<Bxml>"
         f"<StartStream destination=\"{destination}\" name=\"{call_id}\" mode=\"bidirectional\" />"
-        f"<Pause duration=\"{CALL_KEEPALIVE_SECONDS}\" />"
         "</Bxml>"
     )
     logger.info(f"Sending BXML for call {call_id}: {bxml_content}")
