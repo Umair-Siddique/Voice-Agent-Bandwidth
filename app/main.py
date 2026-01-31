@@ -173,20 +173,26 @@ async def receive_from_bandwidth_ws(bandwidth_websocket: WebSocket, openai_webso
     :param openai_websocket:
     :return: None
     """
+    media_count = 0
     try:
+        logger.info("Starting to listen for Bandwidth messages...")
         async for message in bandwidth_websocket.iter_json():
             event = BandwidthStreamEvent.model_validate(message)
+            logger.debug(f"Received Bandwidth event: {event.event_type}")
             match event.event_type:
                 case StreamEventType.STREAM_STARTED:
-                    logger.info(f"Stream started for call ID: {event.metadata.call_id}")
+                    logger.info(f"✓ Stream started for call ID: {event.metadata.call_id}")
                 case StreamEventType.MEDIA:
+                    media_count += 1
+                    if media_count % 50 == 0:  # Log every 50 media packets
+                        logger.debug(f"Received {media_count} media packets")
                     audio_append = {
                         "type": "input_audio_buffer.append",
                         "audio": event.payload
                     }
                     await openai_websocket.send(json.dumps(audio_append))
                 case StreamEventType.STREAM_STOPPED:
-                    logger.info("stream stopped")
+                    logger.info(f"Stream stopped after {media_count} media packets")
                     break
                 case _:
                     logger.warning(f"Unhandled event type: {event.event_type}")
@@ -369,6 +375,27 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
     return Response(status_code=http.HTTPStatus.OK, content=bxml_content, media_type="application/xml")
 
 
+async def connect_and_init_openai(call_id: str):
+    """Connect to OpenAI and initialize the session"""
+    try:
+        openai_websocket = await websockets.connect(
+            f"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
+            additional_headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "OpenAI-Beta": "realtime=v1"
+            },
+            open_timeout=5,
+            ping_interval=None
+        )
+        logger.info(f"✓ Connected to OpenAI WebSocket for call ID: {call_id}")
+        await initialize_openai_session(openai_websocket)
+        logger.info(f"✓ OpenAI session initialized for call ID: {call_id}")
+        return openai_websocket
+    except Exception as e:
+        logger.error(f"Failed to connect to OpenAI: {e}")
+        raise
+
+
 @app.websocket("/ws")
 async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str = None):
     """
@@ -377,6 +404,9 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
     :param call_id:
     :return: None
     """
+    openai_websocket = None
+    audio_buffer = []
+    
     try:
         await bandwidth_websocket.accept()
         logger.info(f"Bandwidth WebSocket connection accepted for call ID: {call_id}")
@@ -386,28 +416,36 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
             await bandwidth_websocket.close(code=1008, reason="Missing call_id parameter")
             return
 
-        logger.info(f"Attempting to connect to OpenAI for call ID: {call_id}")
+        # Start OpenAI connection immediately but don't wait for it
+        logger.info(f"Connecting to OpenAI for call ID: {call_id}")
+        openai_task = asyncio.create_task(connect_and_init_openai(call_id))
+        
+        # Start consuming Bandwidth messages immediately to prevent timeout
         try:
-            # Add connection timeout to prevent hanging
-            async with asyncio.timeout(10):
-                async with websockets.connect(
-                        f"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17",
-                        additional_headers={
-                            "Authorization": f"Bearer {OPENAI_API_KEY}",
-                            "OpenAI-Beta": "realtime=v1"
-                        },
-                        open_timeout=10
-                ) as openai_websocket:
-                    logger.info(f"Connected to OpenAI WebSocket for call ID: {call_id}")
-                    await initialize_openai_session(openai_websocket)
-                    await asyncio.gather(
-                        receive_from_bandwidth_ws(bandwidth_websocket, openai_websocket),
-                        receive_from_openai_ws(openai_websocket, bandwidth_websocket, call_id)
-                    )
+            # Wait for first message from Bandwidth (should be stream_started)
+            first_message = await asyncio.wait_for(bandwidth_websocket.receive_json(), timeout=5.0)
+            event = BandwidthStreamEvent.model_validate(first_message)
+            logger.info(f"First Bandwidth event: {event.event_type}")
+            
+            # Now wait for OpenAI to be ready (should be quick)
+            try:
+                openai_websocket = await asyncio.wait_for(openai_task, timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.error(f"OpenAI connection timeout for call {call_id}")
+                await bandwidth_websocket.close(code=1011, reason="OpenAI connection timeout")
+                return
+            
+            # Now both are connected, start bidirectional streaming
+            await asyncio.gather(
+                receive_from_bandwidth_ws(bandwidth_websocket, openai_websocket),
+                receive_from_openai_ws(openai_websocket, bandwidth_websocket, call_id)
+            )
+                
         except asyncio.TimeoutError:
-            logger.error(f"Timeout connecting to OpenAI for call {call_id}")
-            await bandwidth_websocket.close(code=1011, reason="OpenAI connection timeout")
+            logger.error(f"Timeout waiting for Bandwidth stream start for call {call_id}")
+            await bandwidth_websocket.close(code=1011, reason="Stream start timeout")
             return
+            
     except websockets.exceptions.InvalidStatusCode as e:
         logger.error(f"OpenAI WebSocket connection failed with status {e.status_code}: {e}")
         try:
@@ -420,6 +458,13 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
             await bandwidth_websocket.close(code=1011, reason="Internal server error")
         except:
             pass
+    finally:
+        # Cleanup
+        if openai_websocket:
+            try:
+                await openai_websocket.close()
+            except:
+                pass
 
 
 @app.post("/webhooks/bandwidth/voice/status", status_code=http.HTTPStatus.NO_CONTENT)
