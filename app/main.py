@@ -17,7 +17,7 @@ from rich.text import Text
 from fastapi import FastAPI, Response, WebSocket
 import uvicorn
 
-from models import BandwidthStreamEvent, StreamEventType
+from models import BandwidthStreamEvent, StreamEventType, StreamMedia
 from dotenv import load_dotenv
 
 # Load environment variables from .env file (for local development)
@@ -133,14 +133,21 @@ def build_bandwidth_event(
 
 async def send_bandwidth_event(
     bandwidth_websocket: WebSocket,
-    event: dict,
+    event: BandwidthStreamEvent | dict,
     label: str,
 ) -> None:
     try:
-        await bandwidth_websocket.send_text(json.dumps(event))
-        logger.debug("Sent Bandwidth event: %s", label)
+        if isinstance(event, BandwidthStreamEvent):
+            event_json = event.model_dump_json(by_alias=True, exclude_none=True)
+        else:
+            event_json = json.dumps(event)
+        await bandwidth_websocket.send_text(event_json)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Sent Bandwidth event: %s - %s", label, event_json[:200])
+        else:
+            logger.info("Sent Bandwidth event: %s", label)
     except Exception as e:
-        logger.warning("Failed to send Bandwidth event (%s): %s", label, e)
+        logger.error("Failed to send Bandwidth event (%s): %s", label, e, exc_info=True)
 
 
 async def initialize_openai_session(websocket: ClientConnection):
@@ -275,12 +282,13 @@ async def receive_from_bandwidth_ws(
                         if not stream_context.get("echo_logged"):
                             logger.info("Echo mode enabled: sending inbound audio back to caller")
                             stream_context["echo_logged"] = True
-                        echo_event = build_bandwidth_event(
-                            "playAudio",
+                        echo_event = BandwidthStreamEvent(
+                            event_type=StreamEventType.PLAY_AUDIO,
                             call_id=stream_context.get("call_id"),
-                            stream_id=stream_context.get("stream_id"),
-                            media_payload=payload,
-                            content_type=content_type,
+                            media=StreamMedia(
+                                payload=payload,
+                                content_type=content_type or BANDWIDTH_AUDIO_CONTENT_TYPE
+                            )
                         )
                         await send_bandwidth_event(bandwidth_websocket, echo_event, "echo playAudio")
                 case StreamEventType.STREAM_STOPPED:
@@ -351,21 +359,26 @@ async def receive_from_openai_ws(
                         audio_delta_count,
                         len(audio_payload),
                     )
-                play_audio_event = build_bandwidth_event(
-                    "playAudio",
+                # Create playAudio event using BandwidthStreamEvent model for proper serialization
+                play_audio_event = BandwidthStreamEvent(
+                    event_type=StreamEventType.PLAY_AUDIO,
                     call_id=call_id,
-                    stream_id=stream_context.get("stream_id"),
-                    media_payload=audio_payload,
-                    content_type=BANDWIDTH_AUDIO_CONTENT_TYPE,
+                    media=StreamMedia(
+                        payload=audio_payload,
+                        content_type=BANDWIDTH_AUDIO_CONTENT_TYPE
+                    )
                 )
-                await send_bandwidth_event(bandwidth_websocket, play_audio_event, "playAudio")
+                # Note: stream_id is not needed for playAudio events according to Bandwidth docs
+                await send_bandwidth_event(bandwidth_websocket, play_audio_event, f"playAudio (delta {audio_delta_count})")
                 continue
 
             match message_type:
                 case 'session.created' | 'session.updated':
                     logger.info(f"OpenAI session event: {message_type}")
-                case 'response.created' | 'response.done':
-                    logger.debug(f"Response event: {message_type}")
+                case 'response.created':
+                    logger.debug(f"Response created: {message_type}")
+                case 'response.done':
+                    logger.info(f"Response done - ready for next turn")
                 case 'conversation.item.done':
                     if openai_message.get('item').get('type') == 'function_call':
                         function_name = openai_message.get('item').get('name')
@@ -379,10 +392,9 @@ async def receive_from_openai_ws(
                         "audio_end_ms": 0
                     }
                     await openai_websocket.send(json.dumps(truncate_event))
-                    clear_event = build_bandwidth_event(
-                        "clear",
-                        call_id=call_id,
-                        stream_id=stream_context.get("stream_id"),
+                    clear_event = BandwidthStreamEvent(
+                        event_type=StreamEventType.CLEAR,
+                        call_id=call_id
                     )
                     await send_bandwidth_event(bandwidth_websocket, clear_event, "clear")
                     last_assistant_item = None
