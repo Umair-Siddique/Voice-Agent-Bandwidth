@@ -480,12 +480,14 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
 
     websocket_url = f"wss://{BASE_URL.replace('https://', '').replace('http://', '')}/ws"
     destination = f"{websocket_url}?call_id={call_id}"
-    # StartStream opens a bidirectional audio stream. The call stays active
-    # as long as the WebSocket connection is maintained.
+    # Use SpeakSentence before StartStream to give time for OpenAI connection
+    # and to let the caller know the AI is connecting
     bxml_content = (
         "<?xml version='1.0' encoding='UTF-8'?>"
         "\n<Bxml>"
+        "<SpeakSentence voice=\"julie\">Please wait while I connect you to the AI assistant.</SpeakSentence>"
         f"<StartStream destination=\"{destination}\" name=\"{call_id}\" mode=\"bidirectional\" />"
+        f"<Pause duration=\"600\" />"
         "</Bxml>"
     )
     logger.info(f"Sending BXML for call {call_id}: {bxml_content}")
