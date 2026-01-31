@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import http
 import json
 import logging
@@ -163,7 +162,12 @@ async def initialize_openai_session(websocket: ClientConnection):
         }
     }
     await websocket.send(json.dumps(initial_conversation_item))
-    await websocket.send(json.dumps({"type": "response.create"}))
+    await websocket.send(json.dumps({
+        "type": "response.create",
+        "response": {
+            "modalities": ["audio", "text"]
+        }
+    }))
     logger.info(f"Sent initial greeting request to OpenAI")
     
 
@@ -248,6 +252,7 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
     :return: None
     """
     last_assistant_item = None
+    audio_delta_count = 0
     try:
         async for message in openai_websocket:
             openai_message = json.loads(message)
@@ -262,26 +267,45 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
                 else:
                     logger.info(f"Transcript ({message_type}): {transcript}")
             
+            # Handle any audio delta event types (OpenAI has used multiple names)
+            if (
+                message_type
+                and message_type.endswith(".delta")
+                and "audio" in message_type
+                and "transcript" not in message_type
+                and openai_message.get("delta")
+            ):
+                audio_delta_count += 1
+                audio_payload = openai_message["delta"]
+                if audio_delta_count <= 5 or audio_delta_count % 50 == 0:
+                    logger.info(
+                        "OpenAI audio delta %s: b64_len=%s",
+                        audio_delta_count,
+                        len(audio_payload),
+                    )
+                media = StreamMedia(
+                    content_type="audio/pcmu",
+                    payload=audio_payload
+                )
+                play_audio_event = BandwidthStreamEvent(
+                    event_type=StreamEventType.PLAY_AUDIO,
+                    call_id=call_id,
+                    media=media
+                )
+                try:
+                    await bandwidth_websocket.send_text(
+                        play_audio_event.model_dump_json(by_alias=True, exclude_none=True)
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send audio to Bandwidth: {e}")
+                    break
+                continue
+
             match message_type:
                 case 'session.created' | 'session.updated':
                     logger.info(f"OpenAI session event: {message_type}")
                 case 'response.created' | 'response.done':
                     logger.debug(f"Response event: {message_type}")
-                case 'response.output_audio.delta' if 'delta' in openai_message:
-                    audio_payload = base64.b64encode(base64.b64decode(openai_message['delta'])).decode('utf-8')
-                    media = StreamMedia(
-                        content_type="audio/pcmu",
-                        payload=audio_payload
-                    )
-                    play_audio_event = BandwidthStreamEvent(
-                        event_type=StreamEventType.PLAY_AUDIO,
-                        media=media
-                    )
-                    try:
-                        await bandwidth_websocket.send_text(play_audio_event.model_dump_json(by_alias=True, exclude_none=True))
-                    except Exception as e:
-                        logger.warning(f"Failed to send audio to Bandwidth: {e}")
-                        break
                 case 'conversation.item.done':
                     if openai_message.get('item').get('type') == 'function_call':
                         function_name = openai_message.get('item').get('name')
