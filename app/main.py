@@ -10,7 +10,7 @@ from websockets import ClientConnection
 
 from bandwidth import Configuration, ApiClient, CallsApi
 from bandwidth.models import InitiateCallback, DisconnectCallback
-from bandwidth.models.bxml import PhoneNumber, StartStream, Transfer, Bxml
+from bandwidth.models.bxml import PhoneNumber, Transfer, Bxml
 from rich import inspect
 from rich.console import Console
 from rich.panel import Panel
@@ -66,6 +66,7 @@ bandwidth_voice_api_instance = CallsApi(bandwidth_client)
 AGENT_TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.7))
 AGENT_VOICE = "alloy"
 AGENT_GREETING = "Howdy Partner! I'm your AI assistant. How can I help you today?"
+CALL_KEEPALIVE_SECONDS = int(os.environ.get("CALL_KEEPALIVE_SECONDS", 600))
 
 # Load prompt from file (handle both local and production paths)
 try:
@@ -182,16 +183,42 @@ async def receive_from_bandwidth_ws(bandwidth_websocket: WebSocket, openai_webso
             match event.event_type:
                 case StreamEventType.STREAM_STARTED:
                     logger.info(f"✓ Stream started for call ID: {event.metadata.call_id}")
+                    if event.metadata:
+                        logger.info(
+                            "Stream metadata: stream_id=%s stream_name=%s",
+                            event.metadata.stream_id,
+                            event.metadata.stream_name,
+                        )
+                        if event.metadata.tracks:
+                            for track in event.metadata.tracks:
+                                media_format = track.media_format
+                                logger.info(
+                                    "Track: name=%s encoding=%s sample_rate=%s",
+                                    track.name,
+                                    media_format.encoding if media_format else None,
+                                    media_format.sample_rate if media_format else None,
+                                )
                 case StreamEventType.MEDIA:
                     media_count += 1
-                    if media_count % 50 == 0:  # Log every 50 media packets
-                        logger.debug(f"Received {media_count} media packets")
+                    payload_len = len(event.payload) if event.payload else 0
+                    approx_bytes = (payload_len * 3) // 4
+                    approx_ms = int(approx_bytes / 8) if approx_bytes else 0  # 8kHz u-law
+                    if logger.isEnabledFor(logging.DEBUG) and (media_count <= 5 or media_count % 50 == 0):
+                        logger.debug(
+                            "Media packet %s: b64_len=%s bytes≈%s audio≈%sms",
+                            media_count,
+                            payload_len,
+                            approx_bytes,
+                            approx_ms,
+                        )
                     audio_append = {
                         "type": "input_audio_buffer.append",
                         "audio": event.payload
                     }
                     await openai_websocket.send(json.dumps(audio_append))
                 case StreamEventType.STREAM_STOPPED:
+                    if media_count == 0:
+                        logger.warning("Stream stopped before receiving any media packets")
                     logger.info(f"Stream stopped after {media_count} media packets")
                     break
                 case _:
@@ -226,6 +253,14 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
             openai_message = json.loads(message)
             message_type = openai_message.get('type')
             logger.debug(f"OpenAI message: {message_type}")
+            transcript = openai_message.get("transcript")
+            if transcript:
+                if "input_audio" in (message_type or ""):
+                    logger.info(f"User transcript: {transcript}")
+                elif "output_audio" in (message_type or ""):
+                    logger.info(f"Assistant transcript: {transcript}")
+                else:
+                    logger.info(f"Transcript ({message_type}): {transcript}")
             
             match message_type:
                 case 'session.created' | 'session.updated':
@@ -247,13 +282,12 @@ async def receive_from_openai_ws(openai_websocket: ClientConnection, bandwidth_w
                     except Exception as e:
                         logger.warning(f"Failed to send audio to Bandwidth: {e}")
                         break
-                case 'response.output_audio_transcript.done':
-                    logger.info(openai_message.get('transcript'))
                 case 'conversation.item.done':
                     if openai_message.get('item').get('type') == 'function_call':
                         function_name = openai_message.get('item').get('name')
                         handle_tool_call(function_name, call_id)
                 case 'input_audio_buffer.speech_started':
+                    logger.info("User speech detected")
                     truncate_event = {
                         "type": "conversation.item.truncate",
                         "item_id": last_assistant_item,
@@ -363,14 +397,15 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
     logger.info(f"Received initiate event for call ID: {call_id}")
 
     websocket_url = f"wss://{BASE_URL.replace('https://', '').replace('http://', '')}/ws"
-    start_stream = StartStream(
-        destination=f"{websocket_url}?call_id={call_id}",
-        mode="bidirectional",
-        name=call_id
+    destination = f"{websocket_url}?call_id={call_id}"
+    # Keep the call open while streaming audio to/from OpenAI.
+    bxml_content = (
+        "<?xml version='1.0' encoding='UTF-8'?>"
+        "\n<Bxml>"
+        f"<StartStream destination=\"{destination}\" name=\"{call_id}\" mode=\"bidirectional\" />"
+        f"<Pause duration=\"{CALL_KEEPALIVE_SECONDS}\" />"
+        "</Bxml>"
     )
-    bxml_response = Bxml(nested_verbs=[start_stream])
-    
-    bxml_content = bxml_response.to_bxml()
     logger.info(f"Sending BXML for call {call_id}: {bxml_content}")
     return Response(status_code=http.HTTPStatus.OK, content=bxml_content, media_type="application/xml")
 
