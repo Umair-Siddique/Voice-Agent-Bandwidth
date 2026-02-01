@@ -64,7 +64,7 @@ bandwidth_voice_api_instance = CallsApi(bandwidth_client)
 # OpenAI Agent Settings
 AGENT_TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.7))
 AGENT_VOICE = "alloy"
-AGENT_GREETING = "Howdy Partner! I'm your AI assistant. How can I help you today?"
+AGENT_GREETING = "Hi welcome to bandwidth, I'm an ai agent who help answer your questions"
 CALL_KEEPALIVE_SECONDS = int(os.environ.get("CALL_KEEPALIVE_SECONDS", 600))
 BANDWIDTH_EVENT_FIELD = os.environ.get("BANDWIDTH_EVENT_FIELD", "eventType")
 BANDWIDTH_AUDIO_FIELD = os.environ.get("BANDWIDTH_AUDIO_FIELD", "media")
