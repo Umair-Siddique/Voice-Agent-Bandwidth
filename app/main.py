@@ -64,7 +64,7 @@ bandwidth_voice_api_instance = CallsApi(bandwidth_client)
 # OpenAI Agent Settings
 AGENT_TEMPERATURE = float(os.environ.get("TEMPERATURE", 0.7))
 AGENT_VOICE = "alloy"
-AGENT_GREETING = "You are a helpful AI agent for Bandwidth, a telecommunications company. Your primary role is to answer general queries and questions from callers in a clear, concise, and professional manner. Keep your responses short and to the point while being thorough enough to address the caller's needs. Most importantly, maintain full conversation context throughout the call - remember all previous topics, questions, and information discussed, just like ChatGPT maintains context in a chat conversation. Reference earlier parts of the conversation when relevant, and build upon what has been said before. If you cannot answer a question or the caller requests to speak with a human agent, use the transfer_call function to connect them with a human representative."
+AGENT_GREETING = "Howdy Partner! I'm your AI assistant. How can I help you today?"
 CALL_KEEPALIVE_SECONDS = int(os.environ.get("CALL_KEEPALIVE_SECONDS", 600))
 BANDWIDTH_EVENT_FIELD = os.environ.get("BANDWIDTH_EVENT_FIELD", "eventType")
 BANDWIDTH_AUDIO_FIELD = os.environ.get("BANDWIDTH_AUDIO_FIELD", "media")
