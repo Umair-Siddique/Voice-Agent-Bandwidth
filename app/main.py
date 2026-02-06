@@ -230,48 +230,10 @@ async def receive_from_bandwidth_ws(
     media_count = 0
     stream_started_time = None
     last_event_time = None
-    loop_active = True
-    monitor_task = None
-    
-    # Background task to monitor connection health
-    async def connection_monitor():
-        nonlocal last_event_time, loop_active, media_count, stream_started_time
-        check_count = 0
-        while loop_active:
-            await asyncio.sleep(10)  # Check every 10 seconds
-            if not loop_active:
-                break
-            check_count += 1
-            current_time = time.time()
-            time_since_last = current_time - last_event_time if last_event_time else None
-            
-            # Check WebSocket state
-            ws_state = bandwidth_websocket.client_state.name
-            is_connected = ws_state == "CONNECTED"
-            
-            logger.info(
-                f"Connection health check #{check_count}: media_count={media_count}, "
-                f"time_since_last_event={time_since_last:.1f}s" if time_since_last else "N/A, "
-                f"bw_state={ws_state} (connected={is_connected}), "
-                f"stream_started={stream_started_time is not None}"
-            )
-            
-            # Warn if no media received after stream started and significant time has passed
-            if stream_started_time and media_count == 0:
-                stream_age = current_time - stream_started_time
-                if stream_age > 30:  # 30 seconds without any media
-                    logger.warning(
-                        f"WARNING: Stream active for {stream_age:.1f}s but no media packets received. "
-                        f"Caller may not be speaking or audio not being captured."
-                    )
-    
     try:
         logger.info("Starting to listen for Bandwidth messages...")
         logger.info(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
         logger.info(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
-        
-        # Start the monitor task
-        monitor_task = asyncio.create_task(connection_monitor())
         
         async for message in bandwidth_websocket.iter_json():
             last_event_time = time.time()
@@ -279,7 +241,9 @@ async def receive_from_bandwidth_ws(
             
             try:
                 event = BandwidthStreamEvent.model_validate(message)
-                logger.info(f"Parsed Bandwidth event: {event.event_type} (call_id={event.call_id}, stream_id={event.stream_id})")
+                stream_id = event.metadata.stream_id if event.metadata else None
+                call_id = event.call_id or (event.metadata.call_id if event.metadata else None)
+                logger.info(f"Parsed Bandwidth event: {event.event_type} (call_id={call_id}, stream_id={stream_id})")
             except Exception as parse_error:
                 logger.error(f"Failed to parse Bandwidth event: {parse_error}")
                 logger.error(f"Raw message: {json.dumps(message)}")
@@ -351,10 +315,14 @@ async def receive_from_bandwidth_ws(
                         )
                         await send_bandwidth_event(bandwidth_websocket, echo_event, "echo playAudio")
                 case StreamEventType.STREAM_STOPPED:
-                    loop_active = False
                     stream_duration = None
                     if stream_started_time:
                         stream_duration = time.time() - stream_started_time
+                    
+                    # Extract stream_id from metadata if available
+                    stream_id_from_event = event.metadata.stream_id if event.metadata else None
+                    if stream_id_from_event and not stream_context.get("stream_id"):
+                        stream_context["stream_id"] = stream_id_from_event
                     
                     if media_count == 0:
                         logger.error("=" * 80)
@@ -365,6 +333,11 @@ async def receive_from_bandwidth_ws(
                         logger.error(f"Time since last event: {time.time() - last_event_time:.2f}s" if last_event_time else "N/A")
                         logger.error(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
                         logger.error(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
+                        logger.error("POSSIBLE CAUSES:")
+                        logger.error("1. Caller may not have spoken (no audio input)")
+                        logger.error("2. Audio capture/transmission issue on caller's device")
+                        logger.error("3. Bandwidth stream configuration issue")
+                        logger.error("4. Network/connectivity issue preventing media packets")
                         logger.error("=" * 80)
                     else:
                         logger.info(f"Stream stopped after {media_count} media packets (duration: {stream_duration:.2f}s)" if stream_duration else f"Stream stopped after {media_count} media packets")
@@ -372,7 +345,6 @@ async def receive_from_bandwidth_ws(
                 case _:
                     logger.warning(f"Unhandled event type: {event.event_type}")
     except websockets.exceptions.ConnectionClosedError as e:
-        loop_active = False
         logger.error("=" * 80)
         logger.error("Bandwidth WebSocket ConnectionClosedError")
         logger.error(f"Error: {e}")
@@ -383,7 +355,6 @@ async def receive_from_bandwidth_ws(
         logger.error(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
         logger.error("=" * 80)
     except Exception as e:
-        loop_active = False
         logger.error("=" * 80)
         logger.error("Exception in receive_from_bandwidth_ws")
         logger.error(f"Error type: {type(e).__name__}")
@@ -393,16 +364,6 @@ async def receive_from_bandwidth_ws(
         logger.error("=" * 80)
         logger.error(f"Full traceback:", exc_info=True)
     finally:
-        loop_active = False
-        # Cancel the monitor task
-        if monitor_task:
-            try:
-                monitor_task.cancel()
-                await monitor_task
-            except asyncio.CancelledError:
-                pass
-            except Exception as e:
-                logger.warning(f"Error cancelling monitor task: {e}")
         logger.info(f"Cleaning up Bandwidth WebSocket (state: {bandwidth_websocket.client_state.name})")
         if not bandwidth_websocket.client_state.name == "DISCONNECTED":
             try:
@@ -466,6 +427,8 @@ async def receive_from_openai_ws(
                         len(audio_payload),
                     )
                 # Create playAudio event using BandwidthStreamEvent model for proper serialization
+                # Include stream_id from context if available (some Bandwidth configurations may require it)
+                stream_id = stream_context.get("stream_id")
                 play_audio_event = BandwidthStreamEvent(
                     event_type=StreamEventType.PLAY_AUDIO,
                     call_id=call_id,
@@ -474,8 +437,11 @@ async def receive_from_openai_ws(
                         content_type=BANDWIDTH_AUDIO_CONTENT_TYPE
                     )
                 )
-                # Note: stream_id is not needed for playAudio events according to Bandwidth docs
-                await send_bandwidth_event(bandwidth_websocket, play_audio_event, f"playAudio (delta {audio_delta_count})")
+                # Build the event dict manually to include streamId if we have it
+                event_dict = play_audio_event.model_dump(by_alias=True, exclude_none=True)
+                if stream_id:
+                    event_dict["streamId"] = stream_id
+                await send_bandwidth_event(bandwidth_websocket, event_dict, f"playAudio (delta {audio_delta_count})")
                 continue
 
             match message_type:
