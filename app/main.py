@@ -230,10 +230,48 @@ async def receive_from_bandwidth_ws(
     media_count = 0
     stream_started_time = None
     last_event_time = None
+    loop_active = True
+    monitor_task = None
+    
+    # Background task to monitor connection health
+    async def connection_monitor():
+        nonlocal last_event_time, loop_active, media_count, stream_started_time
+        check_count = 0
+        while loop_active:
+            await asyncio.sleep(10)  # Check every 10 seconds
+            if not loop_active:
+                break
+            check_count += 1
+            current_time = time.time()
+            time_since_last = current_time - last_event_time if last_event_time else None
+            
+            # Check WebSocket state
+            ws_state = bandwidth_websocket.client_state.name
+            is_connected = ws_state == "CONNECTED"
+            
+            logger.info(
+                f"Connection health check #{check_count}: media_count={media_count}, "
+                f"time_since_last_event={time_since_last:.1f}s" if time_since_last else "N/A, "
+                f"bw_state={ws_state} (connected={is_connected}), "
+                f"stream_started={stream_started_time is not None}"
+            )
+            
+            # Warn if no media received after stream started and significant time has passed
+            if stream_started_time and media_count == 0:
+                stream_age = current_time - stream_started_time
+                if stream_age > 30:  # 30 seconds without any media
+                    logger.warning(
+                        f"WARNING: Stream active for {stream_age:.1f}s but no media packets received. "
+                        f"Caller may not be speaking or audio not being captured."
+                    )
+    
     try:
         logger.info("Starting to listen for Bandwidth messages...")
         logger.info(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
         logger.info(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
+        
+        # Start the monitor task
+        monitor_task = asyncio.create_task(connection_monitor())
         
         async for message in bandwidth_websocket.iter_json():
             last_event_time = time.time()
@@ -313,6 +351,7 @@ async def receive_from_bandwidth_ws(
                         )
                         await send_bandwidth_event(bandwidth_websocket, echo_event, "echo playAudio")
                 case StreamEventType.STREAM_STOPPED:
+                    loop_active = False
                     stream_duration = None
                     if stream_started_time:
                         stream_duration = time.time() - stream_started_time
@@ -333,6 +372,7 @@ async def receive_from_bandwidth_ws(
                 case _:
                     logger.warning(f"Unhandled event type: {event.event_type}")
     except websockets.exceptions.ConnectionClosedError as e:
+        loop_active = False
         logger.error("=" * 80)
         logger.error("Bandwidth WebSocket ConnectionClosedError")
         logger.error(f"Error: {e}")
@@ -343,6 +383,7 @@ async def receive_from_bandwidth_ws(
         logger.error(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
         logger.error("=" * 80)
     except Exception as e:
+        loop_active = False
         logger.error("=" * 80)
         logger.error("Exception in receive_from_bandwidth_ws")
         logger.error(f"Error type: {type(e).__name__}")
@@ -352,6 +393,16 @@ async def receive_from_bandwidth_ws(
         logger.error("=" * 80)
         logger.error(f"Full traceback:", exc_info=True)
     finally:
+        loop_active = False
+        # Cancel the monitor task
+        if monitor_task:
+            try:
+                monitor_task.cancel()
+                await monitor_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.warning(f"Error cancelling monitor task: {e}")
         logger.info(f"Cleaning up Bandwidth WebSocket (state: {bandwidth_websocket.client_state.name})")
         if not bandwidth_websocket.client_state.name == "DISCONNECTED":
             try:
