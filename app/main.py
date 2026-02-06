@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import sys
+import time
 import websockets
 from websockets import ClientConnection
 
@@ -227,14 +228,29 @@ async def receive_from_bandwidth_ws(
     :return: None
     """
     media_count = 0
+    stream_started_time = None
+    last_event_time = None
     try:
         logger.info("Starting to listen for Bandwidth messages...")
+        logger.info(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
+        logger.info(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
+        
         async for message in bandwidth_websocket.iter_json():
-            event = BandwidthStreamEvent.model_validate(message)
-            logger.debug(f"Received Bandwidth event: {event.event_type}")
+            last_event_time = time.time()
+            logger.info(f"Raw Bandwidth message received: {json.dumps(message)[:200]}...")
+            
+            try:
+                event = BandwidthStreamEvent.model_validate(message)
+                logger.info(f"Parsed Bandwidth event: {event.event_type} (call_id={event.call_id}, stream_id={event.stream_id})")
+            except Exception as parse_error:
+                logger.error(f"Failed to parse Bandwidth event: {parse_error}")
+                logger.error(f"Raw message: {json.dumps(message)}")
+                continue
+                
             match event.event_type:
                 case StreamEventType.STREAM_STARTED:
-                    logger.info(f"✓ Stream started for call ID: {event.metadata.call_id}")
+                    stream_started_time = time.time()
+                    logger.info(f"✓ Stream started for call ID: {event.metadata.call_id if event.metadata else 'unknown'}")
                     if event.metadata:
                         logger.info(
                             "Stream metadata: stream_id=%s stream_name=%s",
@@ -244,6 +260,7 @@ async def receive_from_bandwidth_ws(
                         stream_context["stream_id"] = event.metadata.stream_id
                         stream_context["stream_name"] = event.metadata.stream_name
                         if event.metadata.tracks:
+                            logger.info(f"Number of tracks: {len(event.metadata.tracks)}")
                             for track in event.metadata.tracks:
                                 media_format = track.media_format
                                 logger.info(
@@ -252,6 +269,10 @@ async def receive_from_bandwidth_ws(
                                     media_format.encoding if media_format else None,
                                     media_format.sample_rate if media_format else None,
                                 )
+                        else:
+                            logger.warning("No tracks found in stream metadata")
+                    else:
+                        logger.warning("No metadata in STREAM_STARTED event")
                 case StreamEventType.MEDIA:
                     media_count += 1
                     payload = event.payload
@@ -292,26 +313,58 @@ async def receive_from_bandwidth_ws(
                         )
                         await send_bandwidth_event(bandwidth_websocket, echo_event, "echo playAudio")
                 case StreamEventType.STREAM_STOPPED:
+                    stream_duration = None
+                    if stream_started_time:
+                        stream_duration = time.time() - stream_started_time
+                    
                     if media_count == 0:
-                        logger.warning("Stream stopped before receiving any media packets")
-                    logger.info(f"Stream stopped after {media_count} media packets")
+                        logger.error("=" * 80)
+                        logger.error("CRITICAL: Stream stopped before receiving any media packets")
+                        logger.error(f"Call ID: {stream_context.get('call_id', 'unknown')}")
+                        logger.error(f"Stream ID: {stream_context.get('stream_id', 'unknown')}")
+                        logger.error(f"Stream duration: {stream_duration:.2f}s" if stream_duration else "Stream duration: unknown")
+                        logger.error(f"Time since last event: {time.time() - last_event_time:.2f}s" if last_event_time else "N/A")
+                        logger.error(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
+                        logger.error(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
+                        logger.error("=" * 80)
+                    else:
+                        logger.info(f"Stream stopped after {media_count} media packets (duration: {stream_duration:.2f}s)" if stream_duration else f"Stream stopped after {media_count} media packets")
                     break
                 case _:
                     logger.warning(f"Unhandled event type: {event.event_type}")
     except websockets.exceptions.ConnectionClosedError as e:
-        logger.error(f"WebSocket connection closed with error: {e}")
+        logger.error("=" * 80)
+        logger.error("Bandwidth WebSocket ConnectionClosedError")
+        logger.error(f"Error: {e}")
+        logger.error(f"Code: {e.code if hasattr(e, 'code') else 'unknown'}")
+        logger.error(f"Reason: {e.reason if hasattr(e, 'reason') else 'unknown'}")
+        logger.error(f"Media packets received: {media_count}")
+        logger.error(f"Stream started: {stream_started_time is not None}")
+        logger.error(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
+        logger.error("=" * 80)
     except Exception as e:
-        logger.error(f"Error reading from Bandwidth WebSocket: {e}", exc_info=True)
+        logger.error("=" * 80)
+        logger.error("Exception in receive_from_bandwidth_ws")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.error(f"Media packets received: {media_count}")
+        logger.error(f"Stream started: {stream_started_time is not None}")
+        logger.error("=" * 80)
+        logger.error(f"Full traceback:", exc_info=True)
     finally:
+        logger.info(f"Cleaning up Bandwidth WebSocket (state: {bandwidth_websocket.client_state.name})")
         if not bandwidth_websocket.client_state.name == "DISCONNECTED":
             try:
                 await bandwidth_websocket.close()
-            except Exception:
-                pass
+                logger.info("Bandwidth WebSocket closed successfully")
+            except Exception as e:
+                logger.warning(f"Error closing Bandwidth WebSocket: {e}")
         try:
+            logger.info(f"Cleaning up OpenAI WebSocket (state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'})")
             await openai_websocket.close()
-        except Exception:
-            pass
+            logger.info("OpenAI WebSocket closed successfully")
+        except Exception as e:
+            logger.warning(f"Error closing OpenAI WebSocket: {e}")
 
 
 async def receive_from_openai_ws(
@@ -330,6 +383,8 @@ async def receive_from_openai_ws(
     last_assistant_item = None
     audio_delta_count = 0
     try:
+        logger.info("Starting to listen for OpenAI messages...")
+        logger.info(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
         async for message in openai_websocket:
             openai_message = json.loads(message)
             message_type = openai_message.get('type')
@@ -409,9 +464,24 @@ async def receive_from_openai_ws(
                 except KeyError:
                     pass
     except websockets.exceptions.ConnectionClosedError as e:
-        logger.error(f"OpenAI WebSocket connection closed with error: {e}")
+        logger.error("=" * 80)
+        logger.error("OpenAI WebSocket ConnectionClosedError")
+        logger.error(f"Error: {e}")
+        logger.error(f"Code: {e.code if hasattr(e, 'code') else 'unknown'}")
+        logger.error(f"Reason: {e.reason if hasattr(e, 'reason') else 'unknown'}")
+        logger.error(f"Audio deltas sent: {audio_delta_count}")
+        logger.error(f"Call ID: {call_id}")
+        logger.error(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
+        logger.error("=" * 80)
     except Exception as e:
-        logger.error(f"Error reading from OpenAI WebSocket: {e}", exc_info=True)
+        logger.error("=" * 80)
+        logger.error("Exception in receive_from_openai_ws")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.error(f"Audio deltas sent: {audio_delta_count}")
+        logger.error(f"Call ID: {call_id}")
+        logger.error("=" * 80)
+        logger.error("Full traceback:", exc_info=True)
     finally:
         try:
             await openai_websocket.close()
@@ -535,12 +605,19 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
     :param call_id:
     :return: None
     """
+    connection_start_time = time.time()
     openai_websocket = None
     stream_context = {"call_id": call_id, "stream_id": None, "stream_name": None, "echo_logged": False}
     
     try:
+        logger.info("=" * 80)
+        logger.info(f"Incoming WebSocket connection request for call ID: {call_id}")
+        logger.info(f"WebSocket URL query params: {bandwidth_websocket.query_params}")
+        logger.info(f"WebSocket headers: {dict(bandwidth_websocket.headers)}")
+        
         await bandwidth_websocket.accept()
-        logger.info(f"Bandwidth WebSocket connection accepted for call ID: {call_id}")
+        logger.info(f"✓ Bandwidth WebSocket connection accepted for call ID: {call_id}")
+        logger.info(f"WebSocket state after accept: {bandwidth_websocket.client_state.name}")
 
         if not call_id:
             logger.error("No call_id provided in WebSocket connection")
@@ -548,54 +625,100 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
             return
 
         # Start OpenAI connection immediately but don't wait for it
-        logger.info(f"Connecting to OpenAI for call ID: {call_id}")
+        logger.info(f"Starting OpenAI connection task for call ID: {call_id}")
         openai_task = asyncio.create_task(connect_and_init_openai(call_id))
         
         # Start consuming Bandwidth messages immediately to prevent timeout
         try:
+            logger.info(f"Waiting for first message from Bandwidth (timeout: 5s)...")
             # Wait for first message from Bandwidth (should be stream_started)
             first_message = await asyncio.wait_for(bandwidth_websocket.receive_json(), timeout=5.0)
-            event = BandwidthStreamEvent.model_validate(first_message)
-            logger.info(f"First Bandwidth event: {event.event_type}")
+            logger.info(f"First message received after {time.time() - connection_start_time:.2f}s")
+            logger.info(f"First message content: {json.dumps(first_message)[:500]}")
+            
+            try:
+                event = BandwidthStreamEvent.model_validate(first_message)
+                logger.info(f"✓ First Bandwidth event parsed: {event.event_type}")
+            except Exception as parse_error:
+                logger.error(f"Failed to parse first Bandwidth event: {parse_error}")
+                logger.error(f"Raw first message: {json.dumps(first_message)}")
+                raise
             
             # Now wait for OpenAI to be ready (should be quick)
+            logger.info(f"Waiting for OpenAI connection to complete (timeout: 3s)...")
             try:
                 openai_websocket = await asyncio.wait_for(openai_task, timeout=3.0)
+                logger.info(f"✓ OpenAI connection ready after {time.time() - connection_start_time:.2f}s")
             except asyncio.TimeoutError:
+                logger.error("=" * 80)
                 logger.error(f"OpenAI connection timeout for call {call_id}")
+                logger.error(f"Time elapsed: {time.time() - connection_start_time:.2f}s")
+                logger.error("=" * 80)
                 await bandwidth_websocket.close(code=1011, reason="OpenAI connection timeout")
                 return
             
             # Now both are connected, start bidirectional streaming
+            logger.info("=" * 80)
+            logger.info("Starting bidirectional streaming between Bandwidth and OpenAI")
+            logger.info(f"Total setup time: {time.time() - connection_start_time:.2f}s")
+            logger.info("=" * 80)
+            
             await asyncio.gather(
                 receive_from_bandwidth_ws(bandwidth_websocket, openai_websocket, stream_context),
                 receive_from_openai_ws(openai_websocket, bandwidth_websocket, call_id, stream_context)
             )
                 
         except asyncio.TimeoutError:
+            logger.error("=" * 80)
             logger.error(f"Timeout waiting for Bandwidth stream start for call {call_id}")
+            logger.error(f"Time elapsed: {time.time() - connection_start_time:.2f}s")
+            logger.error(f"WebSocket state: {bandwidth_websocket.client_state.name}")
+            logger.error("=" * 80)
             await bandwidth_websocket.close(code=1011, reason="Stream start timeout")
             return
             
     except websockets.exceptions.InvalidStatusCode as e:
-        logger.error(f"OpenAI WebSocket connection failed with status {e.status_code}: {e}")
+        logger.error("=" * 80)
+        logger.error("OpenAI WebSocket InvalidStatusCode exception")
+        logger.error(f"Status code: {e.status_code}")
+        logger.error(f"Error: {e}")
+        logger.error(f"Call ID: {call_id}")
+        logger.error(f"Time elapsed: {time.time() - connection_start_time:.2f}s")
+        logger.error("=" * 80)
         try:
             await bandwidth_websocket.close(code=1011, reason="OpenAI connection failed")
-        except:
-            pass
+        except Exception as close_error:
+            logger.warning(f"Error closing Bandwidth WebSocket: {close_error}")
     except Exception as e:
-        logger.error(f"Error in WebSocket handler for call {call_id}: {e}", exc_info=True)
+        logger.error("=" * 80)
+        logger.error("Exception in handle_inbound_websocket")
+        logger.error(f"Error type: {type(e).__name__}")
+        logger.error(f"Error message: {str(e)}")
+        logger.error(f"Call ID: {call_id}")
+        logger.error(f"Time elapsed: {time.time() - connection_start_time:.2f}s")
+        logger.error(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
+        logger.error("=" * 80)
+        logger.error("Full traceback:", exc_info=True)
         try:
             await bandwidth_websocket.close(code=1011, reason="Internal server error")
-        except:
-            pass
+        except Exception as close_error:
+            logger.warning(f"Error closing Bandwidth WebSocket: {close_error}")
     finally:
         # Cleanup
+        logger.info(f"WebSocket handler cleanup for call {call_id}")
+        logger.info(f"Total connection duration: {time.time() - connection_start_time:.2f}s")
         if openai_websocket:
             try:
+                logger.info("Closing OpenAI WebSocket in finally block")
                 await openai_websocket.close()
-            except:
-                pass
+            except Exception as e:
+                logger.warning(f"Error closing OpenAI WebSocket in finally: {e}")
+        if bandwidth_websocket.client_state.name != "DISCONNECTED":
+            try:
+                logger.info("Closing Bandwidth WebSocket in finally block")
+                await bandwidth_websocket.close()
+            except Exception as e:
+                logger.warning(f"Error closing Bandwidth WebSocket in finally: {e}")
 
 
 @app.post("/webhooks/bandwidth/voice/status", status_code=http.HTTPStatus.NO_CONTENT)
@@ -610,7 +733,13 @@ def handle_disconnect_event(callback: DisconnectCallback) -> None:
     call_id = callback.call_id
     disconnect_cause = callback.cause
     error_message = callback.error_message
-    logger.info(f"Received disconnect event for call ID: {call_id}, cause: {disconnect_cause}, error: {error_message}")
+    logger.info("=" * 80)
+    logger.info("Bandwidth Disconnect Event Received")
+    logger.info(f"Call ID: {call_id}")
+    logger.info(f"Disconnect cause: {disconnect_cause}")
+    logger.info(f"Error message: {error_message}")
+    logger.info(f"Full callback data: {callback}")
+    logger.info("=" * 80)
     return
 
 
