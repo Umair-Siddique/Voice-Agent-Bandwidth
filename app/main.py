@@ -138,6 +138,11 @@ async def send_bandwidth_event(
     label: str,
 ) -> None:
     try:
+        # Check if WebSocket is still connected before sending
+        if bandwidth_websocket.client_state.name == "DISCONNECTED":
+            logger.debug(f"Skipping Bandwidth event ({label}) - WebSocket already disconnected")
+            return
+            
         if isinstance(event, BandwidthStreamEvent):
             event_json = event.model_dump_json(by_alias=True, exclude_none=True)
         else:
@@ -147,8 +152,20 @@ async def send_bandwidth_event(
             logger.debug("Sent Bandwidth event: %s - %s", label, event_json[:200])
         else:
             logger.info("Sent Bandwidth event: %s", label)
+    except RuntimeError as e:
+        # FastAPI WebSocket might raise RuntimeError if already closed
+        error_msg = str(e).lower()
+        if "close" in error_msg or "disconnected" in error_msg:
+            logger.debug(f"Failed to send Bandwidth event ({label}) - WebSocket already closed")
+        else:
+            logger.error("Failed to send Bandwidth event (%s): %s", label, e, exc_info=True)
     except Exception as e:
-        logger.error("Failed to send Bandwidth event (%s): %s", label, e, exc_info=True)
+        # Suppress errors for already-closed connections
+        error_msg = str(e).lower()
+        if "close" in error_msg and ("already" in error_msg or "sent" in error_msg or "disconnected" in error_msg):
+            logger.debug(f"Failed to send Bandwidth event ({label}) - WebSocket already closed")
+        else:
+            logger.error("Failed to send Bandwidth event (%s): %s", label, e, exc_info=True)
 
 
 async def initialize_openai_session(websocket: ClientConnection):
@@ -325,20 +342,14 @@ async def receive_from_bandwidth_ws(
                         stream_context["stream_id"] = stream_id_from_event
                     
                     if media_count == 0:
-                        logger.error("=" * 80)
-                        logger.error("CRITICAL: Stream stopped before receiving any media packets")
-                        logger.error(f"Call ID: {stream_context.get('call_id', 'unknown')}")
-                        logger.error(f"Stream ID: {stream_context.get('stream_id', 'unknown')}")
-                        logger.error(f"Stream duration: {stream_duration:.2f}s" if stream_duration else "Stream duration: unknown")
-                        logger.error(f"Time since last event: {time.time() - last_event_time:.2f}s" if last_event_time else "N/A")
-                        logger.error(f"Bandwidth WebSocket state: {bandwidth_websocket.client_state.name}")
-                        logger.error(f"OpenAI WebSocket state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'}")
-                        logger.error("POSSIBLE CAUSES:")
-                        logger.error("1. Caller may not have spoken (no audio input)")
-                        logger.error("2. Audio capture/transmission issue on caller's device")
-                        logger.error("3. Bandwidth stream configuration issue")
-                        logger.error("4. Network/connectivity issue preventing media packets")
-                        logger.error("=" * 80)
+                        logger.warning("=" * 80)
+                        logger.warning("Stream stopped without receiving any media packets")
+                        logger.warning(f"Call ID: {stream_context.get('call_id', 'unknown')}")
+                        logger.warning(f"Stream ID: {stream_context.get('stream_id', 'unknown')}")
+                        logger.warning(f"Stream duration: {stream_duration:.2f}s" if stream_duration else "Stream duration: unknown")
+                        logger.warning(f"Time since last event: {time.time() - last_event_time:.2f}s" if last_event_time else "N/A")
+                        logger.warning("NOTE: This is normal if the caller didn't speak or the call ended before audio was captured")
+                        logger.warning("=" * 80)
                     else:
                         logger.info(f"Stream stopped after {media_count} media packets (duration: {stream_duration:.2f}s)" if stream_duration else f"Stream stopped after {media_count} media packets")
                     break
@@ -364,19 +375,8 @@ async def receive_from_bandwidth_ws(
         logger.error("=" * 80)
         logger.error(f"Full traceback:", exc_info=True)
     finally:
-        logger.info(f"Cleaning up Bandwidth WebSocket (state: {bandwidth_websocket.client_state.name})")
-        if not bandwidth_websocket.client_state.name == "DISCONNECTED":
-            try:
-                await bandwidth_websocket.close()
-                logger.info("Bandwidth WebSocket closed successfully")
-            except Exception as e:
-                logger.warning(f"Error closing Bandwidth WebSocket: {e}")
-        try:
-            logger.info(f"Cleaning up OpenAI WebSocket (state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'})")
-            await openai_websocket.close()
-            logger.info("OpenAI WebSocket closed successfully")
-        except Exception as e:
-            logger.warning(f"Error closing OpenAI WebSocket: {e}")
+        # Don't close WebSockets here - let the main handler do it to avoid race conditions
+        logger.info(f"Bandwidth receive task completed (state: {bandwidth_websocket.client_state.name})")
 
 
 async def receive_from_openai_ws(
@@ -500,15 +500,8 @@ async def receive_from_openai_ws(
         logger.error("=" * 80)
         logger.error("Full traceback:", exc_info=True)
     finally:
-        try:
-            await openai_websocket.close()
-        except Exception:
-            pass
-        if not bandwidth_websocket.client_state.name == "DISCONNECTED":
-            try:
-                await bandwidth_websocket.close()
-            except Exception:
-                pass
+        # Don't close WebSockets here - let the main handler do it to avoid race conditions
+        logger.info(f"OpenAI receive task completed (state: {openai_websocket.state if hasattr(openai_websocket, 'state') else 'unknown'})")
 
 
 def handle_tool_call(function_name: str, call_id: str = None):
@@ -721,20 +714,57 @@ async def handle_inbound_websocket(bandwidth_websocket: WebSocket, call_id: str 
         except Exception as close_error:
             logger.warning(f"Error closing Bandwidth WebSocket: {close_error}")
     finally:
-        # Cleanup
+        # Cleanup - only close WebSockets that are still open
         logger.info(f"WebSocket handler cleanup for call {call_id}")
         logger.info(f"Total connection duration: {time.time() - connection_start_time:.2f}s")
+        
+        # Close OpenAI WebSocket if it exists and is still open
         if openai_websocket:
             try:
-                logger.info("Closing OpenAI WebSocket in finally block")
-                await openai_websocket.close()
+                # Check if WebSocket is already closed by checking state value
+                if hasattr(openai_websocket, 'state'):
+                    # State is an integer: 0=CONNECTING, 1=OPEN, 2=CLOSING, 3=CLOSED
+                    state = openai_websocket.state
+                    if state >= 2:  # CLOSING or CLOSED
+                        logger.debug("OpenAI WebSocket already closed or closing")
+                    else:
+                        logger.info("Closing OpenAI WebSocket in finally block")
+                        await openai_websocket.close()
+                else:
+                    # If we can't check state, try to close but catch exceptions
+                    logger.info("Closing OpenAI WebSocket in finally block")
+                    await openai_websocket.close()
+            except websockets.exceptions.ConnectionClosed:
+                logger.debug("OpenAI WebSocket was already closed")
             except Exception as e:
-                logger.warning(f"Error closing OpenAI WebSocket in finally: {e}")
-        if bandwidth_websocket.client_state.name != "DISCONNECTED":
-            try:
+                # Suppress warnings for already-closed connections
+                error_msg = str(e).lower()
+                if "close" in error_msg and ("already" in error_msg or "sent" in error_msg):
+                    logger.debug(f"OpenAI WebSocket already closed: {e}")
+                else:
+                    logger.warning(f"Error closing OpenAI WebSocket in finally: {e}")
+        
+        # Close Bandwidth WebSocket if it's still connected
+        try:
+            bw_state = bandwidth_websocket.client_state.name
+            if bw_state == "DISCONNECTED":
+                logger.debug("Bandwidth WebSocket already disconnected")
+            else:
                 logger.info("Closing Bandwidth WebSocket in finally block")
                 await bandwidth_websocket.close()
-            except Exception as e:
+        except RuntimeError as e:
+            # FastAPI WebSocket might raise RuntimeError if already closed
+            error_msg = str(e).lower()
+            if "close" in error_msg or "disconnected" in error_msg:
+                logger.debug(f"Bandwidth WebSocket already closed: {e}")
+            else:
+                logger.warning(f"Error closing Bandwidth WebSocket in finally: {e}")
+        except Exception as e:
+            # Suppress warnings for already-closed connections
+            error_msg = str(e).lower()
+            if "close" in error_msg and ("already" in error_msg or "sent" in error_msg or "disconnected" in error_msg):
+                logger.debug(f"Bandwidth WebSocket already closed: {e}")
+            else:
                 logger.warning(f"Error closing Bandwidth WebSocket in finally: {e}")
 
 
