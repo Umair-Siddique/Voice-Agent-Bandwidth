@@ -534,15 +534,6 @@ def health():
     return
 
 
-@app.get("/")
-def root():
-    """
-    Root endpoint for platform health checks.
-    Returns 200 so hosting providers (e.g., Render) don't treat the app as unhealthy.
-    """
-    return {"status": "ok"}
-
-
 @app.get("/status")
 def status():
     """
@@ -583,16 +574,11 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
     destination = f"{websocket_url}?call_id={call_id}"
     # Use SpeakSentence before StartStream to give time for OpenAI connection
     # and to let the caller know the AI is connecting
-    # Important: use Bandwidth's StartStream 'tracks' attribute (mediaTrack enum) instead of a Twilio-style "mode" flag.
-    # Valid values are: 'inbound', 'outbound', or 'both'.
-    # 'both' gives you:
-    #   - inbound: caller -> this WebSocket (so we see MEDIA events and your speech)
-    #   - outbound: this WebSocket -> caller (so playAudio events are actually heard)
     bxml_content = (
         "<?xml version='1.0' encoding='UTF-8'?>"
         "\n<Bxml>"
         "<SpeakSentence voice=\"julie\">Please wait while I connect you to the AI assistant.</SpeakSentence>"
-        f"<StartStream destination=\"{destination}\" name=\"{call_id}\" tracks=\"both\" />"
+        f"<StartStream destination=\"{destination}\" name=\"{call_id}\" mode=\"bidirectional\" />"
         f"<Pause duration=\"600\" />"
         "</Bxml>"
     )
