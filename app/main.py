@@ -574,11 +574,15 @@ def handle_initiate_event(callback: InitiateCallback) -> Response:
     destination = f"{websocket_url}?call_id={call_id}"
     # Use SpeakSentence before StartStream to give time for OpenAI connection
     # and to let the caller know the AI is connecting
+    # Important: use Bandwidth's StartStream attributes (tracks) instead of a Twilio-style "mode" flag.
+    # tracks=\"inbound,outbound\" ensures:
+    #   - inbound: caller -> this WebSocket (so we see MEDIA events and your speech)
+    #   - outbound: this WebSocket -> caller (so playAudio events are actually heard)
     bxml_content = (
         "<?xml version='1.0' encoding='UTF-8'?>"
         "\n<Bxml>"
         "<SpeakSentence voice=\"julie\">Please wait while I connect you to the AI assistant.</SpeakSentence>"
-        f"<StartStream destination=\"{destination}\" name=\"{call_id}\" mode=\"bidirectional\" />"
+        f"<StartStream destination=\"{destination}\" name=\"{call_id}\" tracks=\"inbound,outbound\" />"
         f"<Pause duration=\"600\" />"
         "</Bxml>"
     )
