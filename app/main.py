@@ -534,6 +534,15 @@ def health():
     return
 
 
+@app.get("/")
+def root():
+    """
+    Root endpoint for platform health checks.
+    Returns 200 so hosting providers (e.g., Render) don't treat the app as unhealthy.
+    """
+    return {"status": "ok"}
+
+
 @app.get("/status")
 def status():
     """
